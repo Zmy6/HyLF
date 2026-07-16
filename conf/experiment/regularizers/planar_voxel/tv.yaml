@@ -1,0 +1,17 @@
+# @package experiment.regularizers.planar_voxel
+
+type: planar_voxel
+
+weight:
+  type: exponential_decay
+  start: 1.0
+  decay: 1.0
+  num_epochs: 100
+
+lr_decay_target_ratio: 0.1
+n_iters: 20000
+total_num_tv_iters: 60000
+
+initial_l1_weight: 8e-5
+tv_density_weight: 0.25
+tv_appearance_weight: 0.25

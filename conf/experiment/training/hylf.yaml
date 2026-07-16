@@ -1,0 +1,53 @@
+# @package experiment.training
+
+batch_size: 16384
+ray_chunk: 16384
+render_ray_chunk: 16384
+
+log_every: 1
+val_every: 10
+render_every: 40
+ckpt_every: 40
+test_every: 20
+flush_logs: 1000
+
+num_workers: 16
+num_gpus: 1
+
+weight_init:
+  type: none
+
+loss:
+  type: mse
+
+sample_with_replacement: True
+num_iters: 4000
+num_epochs: 40
+
+optimizers:
+  color:
+    optimizer: adam
+    lr: 0.005
+    weight_decay: 0
+    lr_scheduler: exp
+    decay_epoch: 100
+    decay_gamma: 0.125
+    reset_opt_list: [4000, 6000, 8000, 10000, 12000]
+
+  embedding_impl:
+    optimizer: adam
+    lr: 0.001
+    weight_decay: 0
+    lr_scheduler: exp
+    decay_epoch: 100
+    decay_gamma: 0.125
+    reset_opt_list: [4000, 6000, 8000, 10000, 12000]
+
+  camera_geometry:
+    optimizer: adam
+    lr: 0.001
+    weight_decay: 0
+    lr_scheduler: exp
+    decay_epoch: 100
+    decay_gamma: 0.125
+    reset_opt_list: [4000, 6000, 8000, 10000, 12000]

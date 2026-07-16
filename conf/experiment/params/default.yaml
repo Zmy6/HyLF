@@ -1,0 +1,22 @@
+# @package experiment.params
+
+ckpt_dir: checkpoints
+log_dir: logs
+data_dir: data
+name: "${experiment.dataset.name}_${experiment.dataset.scene}"
+
+print_loss: False
+save_results: True
+
+tensorboard: False
+test_only: False
+render_only: False
+load_from_weights: False
+start_epoch: 0
+evaluation_epoch:
+
+seed: 1
+reference_rng_compatibility: True
+
+save_video_dir: val_videos
+save_image_dir: val_images

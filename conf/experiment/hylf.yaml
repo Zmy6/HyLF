@@ -1,0 +1,8 @@
+# @package experiment
+
+defaults:
+  - params: default
+  - dataset: sparse_angular
+  - model: hylf
+  - training: hylf
+  - regularizers: none

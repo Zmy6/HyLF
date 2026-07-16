@@ -1,0 +1,25 @@
+# @package experiment.dataset
+
+name: sparse_angular
+scene: bedroom
+dataset_directory: HCI_new
+root_dir: "${experiment.params.data_dir}/${experiment.dataset.dataset_directory}/${experiment.dataset.scene}/"
+
+image_size:
+downsample: 1
+
+val_pairs: []
+val_all: False
+
+render_params:
+  crop: 1.0
+
+angular_grid:
+  rows: 9
+  cols: 9
+  step: 6
+
+  start_row: 1
+  end_row: 8
+  start_col: 1
+  end_col: 8
