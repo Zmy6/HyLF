@@ -51,12 +51,6 @@ class PlanarVoxelGrid(PlanarVoxelFactorization):
         return density, color
 
     def forward_dense(self, x: Dict[str, torch.Tensor]):
-        """Equivalent masks with fixed shapes; suitable for compilation/graphs.
-
-        Masking color before its affine correction preserves the original
-        derivative at zero opacity. The training background coin is sampled
-        on the GPU, so its RNG sequence differs from the eager reference.
-        """
         batch_size = x["points"].shape[0]
         xyz = x["points"].reshape(batch_size, -1, 3)
         distances = x["distances"].reshape(batch_size, -1)
