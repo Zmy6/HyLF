@@ -3,6 +3,7 @@
 from functools import partial
 
 import numpy as np
+import torch
 from torch import nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
@@ -28,13 +29,18 @@ def build_optimizer(config, modules):
             parameters.extend(module.parameters())
     if config.optimizer != "adam":
         raise ValueError(f"Unsupported optimizer: {config.optimizer}")
-    return Adam(
-        parameters,
+    optimizer_kwargs = dict(
         lr=config.lr,
         eps=1e-8,
         weight_decay=config.weight_decay,
         betas=(0.9, 0.99),
     )
+    
+    if bool(getattr(config, "fused", False)):
+        if not torch.cuda.is_available():
+            raise RuntimeError("fused Adam requires a CUDA device")
+        optimizer_kwargs["fused"] = True
+    return Adam(parameters, **optimizer_kwargs)
 
 
 def exponential_decay_factor(decay_gamma, stop_epoch, decay_epoch, epoch):
