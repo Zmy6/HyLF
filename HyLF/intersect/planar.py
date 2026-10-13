@@ -5,7 +5,7 @@ from typing import Dict
 import torch
 from torch import nn
 
-from hylf.activations import get_activation
+from HyLF.activations import get_activation
 from utils.intersect_utils import intersect_rays_with_axis_plane, sort_depths
 
 
