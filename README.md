@@ -90,7 +90,9 @@ bash scripts/train_ablation_planar_voxel.sh 0 bicycle 6 HCI_new
   title   = {HyLF: Sparse Angular Super-resolution from Hybrid Light Fields without Known Camera Parameters},
   author  = {Zhao, Mingyuan and Yang, Da and Cong, Ruixuan and Cui, Zhenglong and Chen, Rongshan and Ke, Wei and Sheng, Hao},
   journal = {IEEE Transactions on Circuits and Systems for Video Technology},
-  year    = {2026},
-  doi     = {10.1109/TCSVT.2026.3688726}
+  year = {2026},
+  volume = {36},
+  number = {9},
+  pages = {13090-13102},
 }
 ```
