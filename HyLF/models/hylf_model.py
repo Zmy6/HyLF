@@ -5,9 +5,9 @@ from typing import Dict
 import torch
 from torch import nn
 
-from hylf.embedding import embedding_registry
-from hylf.nets import network_registry
-from hylf.param import RayParameterization
+from HyLF.embedding import embedding_registry
+from HyLF.nets import network_registry
+from HyLF.param import RayParameterization
 
 
 class HybridColorDecoder(nn.Module):
