@@ -6,82 +6,124 @@ Paper: [doi:10.1109/TCSVT.2026.3688726](https://doi.org/10.1109/TCSVT.2026.36887
 
 ## Installation
 
+The default training configuration requires an NVIDIA GPU. The environment pins PyTorch 2.1.2, CUDA 12.1, and PyTorch Lightning 1.9.5 for the compiled training path.
+
 ```bash
 conda env create -f environment.yml
 conda activate hylf
 ```
 
+Run the commands below from the project root, where `train.py` and `conf/` are located. The Python package is named `HyLF`; the environment and experiment configuration are named `hylf`.
+
 ## Data
 
-Each scene directory must contain only a lexicographically sortable 9x9 set of 81 RGB view images. The expected layout is:
+Each scene directory must contain only 81 RGB view images, sorted lexicographically in row-major order over a 9x9 angular grid. For zero-padded filenames, the expected layout is:
 
 ```text
-data/
+<data-root>/
   HCI_new/
-    bicycle/
-      <81 view images>
-    boxes/
-  INRIA/
-    Bee/
-      <81 view images>
-  30scene/
-    Cars/
+    bedroom/
+      000.jpg
+      ...
+      080.jpg
+  <dataset-directory>/
+    <scene>/
       <81 view images>
 ```
+
+Set `DATA_ROOT` to the directory containing the dataset folders. For the local five-dataset collection, use `/root/ACEFlow/data`, containing `HCI_new`, `HCI_old`, `30scene`, `occlusions`, and `reflective`. The scene loader also accepts other dataset directory names with the same layout.
+
+Images use their native resolution by default (`image_size: null`, `downsample: 1`); 512x512 inputs therefore remain 512x512. The angular grid size describes camera views, not image pixels.
 
 ## Training
 
-All scene scripts use the same interface:
+The main script accepts:
 
 ```text
-<script> <gpu-id> <scene> <angular-step> <dataset-directory> [hydra-overrides...]
+bash scripts/train_experiment.sh <experiment-variant> <gpu-id> <scene> <angular-step> <dataset-directory> [hydra-overrides...]
 ```
 
-For example, train HyLF on the HCI_new `bicycle` scene using the 2x2 views of a centered 7x7 light field:
+For example, train HyLF on `HCI_new/bedroom` for 20 epochs using views `010.jpg`, `016.jpg`, `064.jpg`, and `070.jpg`:
 
 ```bash
-bash scripts/train_hylf.sh 0 bicycle 6 HCI_new
+DATA_ROOT=/root/ACEFlow/data NUM_EPOCHS=20 PRINT_LOSS=False \
+bash scripts/train_experiment.sh hylf 0 bedroom 6 HCI_new
 ```
 
-The angular step determines the reconstructed LF:
+Replace `bedroom` and `HCI_new` to train another scene. `gpu-id` selects the visible GPU for that process. Independent scene processes can share a GPU if sufficient memory is available. The script defaults to `DATA_ROOT=/data`, so set the data path explicitly.
 
-| Step | input LF | Reconstructed LF |
-| ---: | :---: | :---: |
-| 6 | 2x2 | 7x7 |
-| 7 | 2x2 | 8x8 |
-| 8 | 2x2 | 9x9 |
+The default configuration in `conf/experiment/hylf.yaml` and `conf/experiment/training/hylf.yaml` uses:
 
-To reproduce the paper's Table 1-3:
+| Setting | Value |
+| --- | --- |
+| Epochs | 20 |
+| Training steps per epoch | 4,000 |
+| Total training steps | 80,000 |
+| Rays per batch | 16,384 |
+| Ray predictor | Six MLP layers, width 256; 32 samples per ray; 18 outputs per sample |
+| Regularization | Planar voxel TV and L1 |
+| Acceleration | GPU ray sampling, fused Adam, dense voxel sampling, `torch.compile`, CUDA Graphs, compiled regularizers |
+| Validation and test during training | Disabled, including initial sanity validation |
+| Checkpoint saving | Disabled |
 
-```bash
-bash scripts/train_paper_tables.sh
-```
+`NUM_EPOCHS` overrides the script's default of 20. Additional Hydra overrides go at the end of the command. GPU sampling defines an epoch as 4,000 random batches rather than one pass over the training pixels.
+
+With `disable_validation: True` and `disable_checkpointing: True`, training does not render or save per-epoch predictions or checkpoints. The current `train.py` also does **not** save final weights or run a final evaluation after training. Hydra can still write configuration/log files, and empty result directories may be created.
+
+### Training views and evaluation coverage
+
+The script's angular step determines both the four training positions and the default evaluation region, if evaluation is enabled:
+
+| Step | Training image IDs | Default evaluation region | Held-out views in that region |
+| ---: | --- | :---: | ---: |
+| 6 | 010, 016, 064, 070 | Centered 7x7 | 45 |
+| 7 | 000, 007, 063, 070 | 8x8 starting at row/column 0 | 60 |
+| 8 | 000, 008, 072, 080 | Full 9x9 | 77 |
+
+For the task using `010/016/064/070` as inputs and the other 77 views of the full 9x9 grid as targets, keep **step 6** for training. The separate rendering stage must explicitly select those 77 targets; changing the training step to 8 changes the input views.
+
+The current entry point does not read `train_ids.txt` or `test_extrap_2x2_to_9x9_output.txt`. Step 6 selects the same four inputs as `/root/ACEFlow/data/train_ids.txt`; the 77-view task list must be handled by a separate rendering/evaluation workflow. The dataset's `val_pairs` option supports explicit evaluation coordinates.
 
 ## Evaluation
 
+`testY.py` scores existing prediction/ground-truth image pairs; it does not load a trained model or render views. It reports Y-PSNR, Y-SSIM, and LPIPS using its implemented preprocessing. Predictions must first be generated by a separate rendering stage.
+
+For example, to score existing epoch-20 results for `bedroom`:
+
 ```bash
 python testY.py \
-  --log-root /path/to/HyLF_runs/logs \
-  --dataset all \
+  --log-root /path/to/rendered/logs \
+  --scenes bedroom \
   --angular-step 6 \
-  --validation-epoch 30 \
-  --output-directory /path/to/HyLF_runs/metrics/epoch_30
+  --validation-epoch 20 \
+  --output-directory /path/to/metrics/epoch_20
 ```
 
-## Ablations
+The expected image directory is:
 
-The repository includes the three paper-oriented alternatives retained by the original experiment code:
-
-```bash
-bash scripts/train_ablation_two_plane.sh 0 bicycle 6 HCI_new
-bash scripts/train_ablation_multi_plane.sh 0 bicycle 6 HCI_new
-bash scripts/train_ablation_planar_voxel.sh 0 bicycle 6 HCI_new
+```text
+<log-root>/hylf_bedroom_step_6/val_images/20/
+  <view>_pred.png
+  <view>_gt.png
 ```
+
+An `eval/` subdirectory is used when present. The evaluator scores every matching image pair in that directory; `--angular-step` selects the experiment directory and output labels, not the target views. For the full 9x9 extrapolation task, ensure the directory contains exactly the 77 requested pairs. The evaluator's task label is derived from the step, so step 6 still produces a `2x2_to_7x7` label even when 77 pairs are supplied.
+
+`--dataset all` selects the historical paper scene lists, not all scenes in the local five-dataset collection. Use `--scenes` for explicit scene selection. The training command above does not create these evaluation inputs or a reusable final checkpoint.
+
+## Legacy experiment scripts and ablations
+
+`scripts/train_paper_tables.sh` and `scripts/regenerate_paper_results.sh` retain the older 30-epoch workflow, machine-specific paths, and assumptions about saved checkpoints and validation images. They require adaptation before use with the current training-only defaults and the five-dataset 77-view task.
+
+The repository retains these ablation model configurations:
 
 - `ablation_two_plane` replaces the learned two-plane ray parameterization with origin-direction rays and removes angular flow.
 - `ablation_multi_plane` reduces the plane-intersection feature channels from 32 to 1 and removes angular flow.
 - `ablation_planar_voxel` replaces the planar neural voxel decoder with an RGB MLP and removes angular flow.
 
+The default acceleration and TV/L1 settings target the full HyLF model. In particular, the RGB MLP ablation requires a separate configuration that disables voxel-specific acceleration and removes planar voxel regularization; its wrapper is not compatible with the default configuration as-is.
+
+The short scene wrappers, such as `scripts/train_hylf.sh`, execute `scripts/train_experiment.sh` directly. If using these wrappers after unpacking a ZIP without executable permissions, first run `chmod +x scripts/train_experiment.sh`.
 
 ## Citation
 
@@ -90,9 +132,10 @@ bash scripts/train_ablation_planar_voxel.sh 0 bicycle 6 HCI_new
   title   = {HyLF: Sparse Angular Super-resolution from Hybrid Light Fields without Known Camera Parameters},
   author  = {Zhao, Mingyuan and Yang, Da and Cong, Ruixuan and Cui, Zhenglong and Chen, Rongshan and Ke, Wei and Sheng, Hao},
   journal = {IEEE Transactions on Circuits and Systems for Video Technology},
-  year = {2026},
-  volume = {36},
-  number = {9},
-  pages = {13090-13102},
+  year    = {2026},
+  volume  = {36},
+  number  = {9},
+  pages   = {13090-13102},
+  doi     = {10.1109/TCSVT.2026.3688726}
 }
 ```
