@@ -5,11 +5,11 @@ from typing import Dict
 import torch
 from torch import nn
 
-from hylf.activations import get_activation
-from hylf.intersect import intersector_registry
-from hylf.nets import network_registry
-from hylf.param import RayParameterization
-from hylf.pe import encoding_registry
+from HyLF.activations import get_activation
+from HyLF.intersect import intersector_registry
+from HyLF.nets import network_registry
+from HyLF.param import RayParameterization
+from HyLF.pe import encoding_registry
 
 
 class HybridRayPredictor(nn.Module):
