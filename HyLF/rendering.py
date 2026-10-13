@@ -19,7 +19,9 @@ renderer_registry = {"hylf": HybridLightFieldRenderer}
 
 def render_chunked(rays, renderer, chunk_size):
     results = defaultdict(list)
-
+    if rays.shape[0] <= chunk_size:
+        return renderer(rays)
+        
     for start in range(0, rays.shape[0], chunk_size):
         outputs = renderer(rays[start:start + chunk_size])
         for key, value in outputs.items():
