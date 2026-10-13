@@ -6,3 +6,4 @@ defaults:
   - model: hylf
   - training: hylf
   - regularizers: none
+  - regularizers/planar_voxel: tv
