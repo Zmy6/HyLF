@@ -39,6 +39,39 @@ class PlanarVoxelRegularizer(BaseRegularizer):
         self.tv_density_weight = cfg.tv_density_weight
         self.tv_appearance_weight = cfg.tv_appearance_weight
 
+        # Graph capture cannot read a changing Python iteration or mutate the
+        # reference TV counters on every replay. Cache the constant outer
+        # weight and receive the TV phase explicitly from the training loop.
+        self.graph_outer_weight = None
+        if isinstance(self.weight, (int, float)):
+            self.graph_outer_weight = float(self.weight)
+        elif self.weight.type == "exponential_decay" and self.weight.decay == 1:
+            self.graph_outer_weight = float(self.weight.start)
+
+    def graph_loss(self, voxel_grid, include_tv):
+        """Pure form of the existing loss, preserving its density-TV sum.
+
+        The reference uses configured TV weights, not the decaying bookkeeping
+        attributes, and adds density TV a second time when appearance TV is
+        enabled. Keep those semantics to match the archived HyLF experiments.
+        """
+        total_loss = self.l1_weight * voxel_grid.density_l1_loss()
+        if include_tv:
+            tv_loss = 0.0
+            if self.configured_tv_density_weight > 0:
+                tv_loss = (
+                    voxel_grid.density_tv_loss(self.tv_loss)
+                    * self.configured_tv_density_weight
+                )
+                total_loss = total_loss + tv_loss
+            if self.configured_tv_appearance_weight > 0:
+                tv_loss = tv_loss + (
+                    voxel_grid.appearance_tv_loss(self.tv_loss)
+                    * self.configured_tv_appearance_weight
+                )
+                total_loss = total_loss + tv_loss
+        return total_loss * self.graph_outer_weight
+
     def _compute_loss(self):
         voxel_grid = self.get_hylf_system().render_fn.model.color_model.net
         total_loss = 0.0
