@@ -10,15 +10,34 @@ def voxel_count_to_grid_resolution(voxel_count, bounding_box):
     return ((xyz_max - xyz_min) / voxel_size).long().tolist()
 
 
-def compute_volume_rendering_weights(sigma, distance):
+class _PositiveCumprod(torch.autograd.Function):
+    """Linear-time derivative for strictly positive transmittance factors.
+
+    The general cumprod derivative must handle zero factors. Under AOTAutograd
+    that path expands into a scan for every sample. Our factors include a
+    positive epsilon, so dL/dx = reverse_cumsum(dL/dy * y) / x is sufficient.
+    """
+    @staticmethod
+    def forward(ctx, values):
+        product = values.cumprod(-1)
+        ctx.save_for_backward(values, product)
+        return product
+
+    @staticmethod
+    def backward(ctx, gradient):
+        values, product = ctx.saved_tensors
+        accumulated = (gradient * product).flip(-1).cumsum(-1).flip(-1)
+        return accumulated / values
+
+
+def compute_volume_rendering_weights(sigma, distance, fast_cumprod=False):
     alpha = 1.0 - torch.exp(-sigma * distance)
-    transmittance = torch.cumprod(
-        torch.cat(
-            [torch.ones_like(alpha[:, :1]), 1.0 - alpha + 1e-10],
-            dim=-1,
-        ),
+    factors = torch.cat(
+        [torch.ones_like(alpha[:, :1]), 1.0 - alpha + 1e-10],
         dim=-1,
     )
+    transmittance = (_PositiveCumprod.apply(factors) if fast_cumprod
+                     else factors.cumprod(-1))
     return alpha * transmittance[:, :-1]
 
 
