@@ -11,12 +11,6 @@ def voxel_count_to_grid_resolution(voxel_count, bounding_box):
 
 
 class _PositiveCumprod(torch.autograd.Function):
-    """Linear-time derivative for strictly positive transmittance factors.
-
-    The general cumprod derivative must handle zero factors. Under AOTAutograd
-    that path expands into a scan for every sample. Our factors include a
-    positive epsilon, so dL/dx = reverse_cumsum(dL/dy * y) / x is sufficient.
-    """
     @staticmethod
     def forward(ctx, values):
         product = values.cumprod(-1)
