@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from hylf.activations import get_activation
+from HyLF.activations import get_activation
 
 
 class DenseMLP(nn.Module):
