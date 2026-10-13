@@ -14,11 +14,19 @@ flush_logs: 1000
 num_workers: 16
 num_gpus: 1
 
-fast_mode: False
-gpu_sampling: False
-fused_optimizer: False
-skip_train_metrics: False
-prune_unused_outputs: True
+fast_mode: True
+gpu_sampling: True
+fused_optimizer: True
+skip_train_metrics: True
+prune_unused_outputs: False
+dense_voxel_sampling: True
+native_grid_sample: True
+compile_training: True
+cuda_graph_training: True
+compile_regularizers: True
+
+disable_validation: True
+disable_checkpointing: True
 
 weight_init:
   type: none
@@ -28,7 +36,7 @@ loss:
 
 sample_with_replacement: True
 num_iters: 4000
-num_epochs: 40
+num_epochs: 20
 
 optimizers:
   color:
