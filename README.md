@@ -50,26 +50,6 @@ DATA_ROOT=/root/ACEFlow/data NUM_EPOCHS=20 PRINT_LOSS=False \
 bash scripts/train_experiment.sh hylf 0 bedroom 6 HCI_new
 ```
 
-Replace `bedroom` and `HCI_new` to train another scene. `gpu-id` selects the visible GPU for that process. Independent scene processes can share a GPU if sufficient memory is available. The script defaults to `DATA_ROOT=/data`, so set the data path explicitly.
-
-The default configuration in `conf/experiment/hylf.yaml` and `conf/experiment/training/hylf.yaml` uses:
-
-| Setting | Value |
-| --- | --- |
-| Epochs | 20 |
-| Training steps per epoch | 4,000 |
-| Total training steps | 80,000 |
-| Rays per batch | 16,384 |
-| Ray predictor | Six MLP layers, width 256; 32 samples per ray; 18 outputs per sample |
-| Regularization | Planar voxel TV and L1 |
-| Acceleration | GPU ray sampling, fused Adam, dense voxel sampling, `torch.compile`, CUDA Graphs, compiled regularizers |
-| Validation and test during training | Disabled, including initial sanity validation |
-| Checkpoint saving | Disabled |
-
-`NUM_EPOCHS` overrides the script's default of 20. Additional Hydra overrides go at the end of the command. GPU sampling defines an epoch as 4,000 random batches rather than one pass over the training pixels.
-
-With `disable_validation: True` and `disable_checkpointing: True`, training does not render or save per-epoch predictions or checkpoints. The current `train.py` also does **not** save final weights or run a final evaluation after training. Hydra can still write configuration/log files, and empty result directories may be created.
-
 ### Training views and evaluation coverage
 
 The script's angular step determines both the four training positions and the default evaluation region, if evaluation is enabled:
@@ -110,20 +90,6 @@ The expected image directory is:
 An `eval/` subdirectory is used when present. The evaluator scores every matching image pair in that directory; `--angular-step` selects the experiment directory and output labels, not the target views. For the full 9x9 extrapolation task, ensure the directory contains exactly the 77 requested pairs. The evaluator's task label is derived from the step, so step 6 still produces a `2x2_to_7x7` label even when 77 pairs are supplied.
 
 `--dataset all` selects the historical paper scene lists, not all scenes in the local five-dataset collection. Use `--scenes` for explicit scene selection. The training command above does not create these evaluation inputs or a reusable final checkpoint.
-
-## Legacy experiment scripts and ablations
-
-`scripts/train_paper_tables.sh` and `scripts/regenerate_paper_results.sh` retain the older 30-epoch workflow, machine-specific paths, and assumptions about saved checkpoints and validation images. They require adaptation before use with the current training-only defaults and the five-dataset 77-view task.
-
-The repository retains these ablation model configurations:
-
-- `ablation_two_plane` replaces the learned two-plane ray parameterization with origin-direction rays and removes angular flow.
-- `ablation_multi_plane` reduces the plane-intersection feature channels from 32 to 1 and removes angular flow.
-- `ablation_planar_voxel` replaces the planar neural voxel decoder with an RGB MLP and removes angular flow.
-
-The default acceleration and TV/L1 settings target the full HyLF model. In particular, the RGB MLP ablation requires a separate configuration that disables voxel-specific acceleration and removes planar voxel regularization; its wrapper is not compatible with the default configuration as-is.
-
-The short scene wrappers, such as `scripts/train_hylf.sh`, execute `scripts/train_experiment.sh` directly. If using these wrappers after unpacking a ZIP without executable permissions, first run `chmod +x scripts/train_experiment.sh`.
 
 ## Citation
 
