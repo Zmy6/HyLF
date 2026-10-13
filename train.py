@@ -9,12 +9,11 @@ import numpy as np
 import torch
 from iopath.common.file_io import NativePathHandler, PathManager
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import TQDMProgressBar
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.utilities.seed import seed_everything
 
-from hylf import HyLFDataModule, HyLFSystem, HyLFTrainer
+from HyLF import HyLFDataModule, HyLFSystem, HyLFTrainer
 
 
 class HyLFModelCheckpoint(ModelCheckpoint):
@@ -42,6 +41,15 @@ def run_training(root_config: DictConfig) -> None:
     OmegaConf.set_struct(root_config, False)
     experiment_config = root_config.experiment
 
+    disable_validation = (
+        bool(getattr(experiment_config.training, "disable_validation", False))
+        and not bool(getattr(experiment_config.params, "test_only", False))
+        and not bool(getattr(experiment_config.params, "render_only", False))
+    )
+    disable_checkpointing = bool(
+        getattr(experiment_config.training, "disable_checkpointing", False)
+    )
+
     seed_everything(experiment_config.params.seed, workers=True)
     os.chdir(Path(__file__).resolve().parent)
 
@@ -56,8 +64,10 @@ def run_training(root_config: DictConfig) -> None:
         os.path.expanduser(experiment_config.params.ckpt_dir),
         experiment_config.params.name,
     )
-    path_manager.mkdirs(log_dir)
-    path_manager.mkdirs(checkpoint_dir)
+    if experiment_config.params.tensorboard or experiment_config.params.save_results:
+        path_manager.mkdirs(log_dir)
+    if not disable_checkpointing:
+        path_manager.mkdirs(checkpoint_dir)
 
     if experiment_config.params.save_results:
         experiment_config.params.save_video_dir = os.path.join(
@@ -92,30 +102,23 @@ def run_training(root_config: DictConfig) -> None:
     )
     if not path_manager.exists(resume_checkpoint_path):
         resume_checkpoint_path = None
+    if disable_checkpointing and not experiment_config.params.load_from_weights:
+        resume_checkpoint_path = None
 
-    full_checkpoint_callback = HyLFModelCheckpoint(
-        dirpath=checkpoint_dir,
-        filename="{epoch:d}",
-        monitor="val/loss",
-        mode="min",
-        save_top_k=0,
-        save_last=True,
-        save_on_train_epoch_end=True,
-        every_n_epochs=experiment_config.training.ckpt_every,
-    )
-    full_checkpoint_callback.CHECKPOINT_NAME_LAST = "last"
-    weights_checkpoint_callback = HyLFModelCheckpoint(
-        save_weights_only=True,
-        dirpath=checkpoint_dir,
-        filename="{epoch:d}-weights",
-        monitor="val/loss",
-        mode="min",
-        save_top_k=0,
-        save_last=True,
-        save_on_train_epoch_end=True,
-        every_n_epochs=experiment_config.training.ckpt_every,
-    )
-    weights_checkpoint_callback.CHECKPOINT_NAME_LAST = "last-weights"
+    callbacks = []
+    if not disable_checkpointing:
+        full_checkpoint_callback = HyLFModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="{epoch:d}",
+            monitor="val/loss",
+            mode="min",
+            save_top_k=0,
+            save_last=True,
+            save_on_train_epoch_end=True,
+            every_n_epochs=experiment_config.training.ckpt_every,
+        )
+        full_checkpoint_callback.CHECKPOINT_NAME_LAST = "last"
+        callbacks.append(full_checkpoint_callback)
 
     if (
         resume_checkpoint_path is not None
@@ -142,11 +145,8 @@ def run_training(root_config: DictConfig) -> None:
     )
     trainer = HyLFTrainer(
         experiment_config,
-        callbacks=[
-            full_checkpoint_callback,
-            weights_checkpoint_callback,
-            TQDMProgressBar(refresh_rate=10),
-        ],
+        callbacks=callbacks,
+        enable_checkpointing=not disable_checkpointing,
         resume_from_checkpoint=(
             resume_checkpoint_path
             if not experiment_config.params.load_from_weights
@@ -155,7 +155,12 @@ def run_training(root_config: DictConfig) -> None:
         logger=logger,
         accelerator="gpu",
         strategy="ddp" if experiment_config.training.num_gpus > 1 else None,
-        check_val_every_n_epoch=experiment_config.training.val_every,
+        check_val_every_n_epoch=(
+            None if disable_validation else experiment_config.training.val_every
+        ),
+        limit_val_batches=0 if disable_validation else None,
+        num_sanity_val_steps=0 if disable_validation else 2,
+        enable_progress_bar=False,
         benchmark=False,
         profiler=None,
     )
