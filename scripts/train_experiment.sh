@@ -41,13 +41,13 @@ esac
 
 regularizer_override=()
 if [[ "$experiment_variant" != "ablation_planar_voxel" ]]; then
-    regularizer_override+=(+experiment/regularizers/planar_voxel=tv)
+    regularizer_override+=(experiment/regularizers/planar_voxel=tv)
 fi
 
 python_executable=${PYTHON_BIN:-python}
 data_root=${DATA_ROOT:-/data}
 max_epochs=${NUM_EPOCHS:-30}
-render_interval=${RENDER_EVERY:-30}
+render_interval=${RENDER_EVERY:-20}
 print_loss=${PRINT_LOSS:-True}
 checkpoint_interval=${CKPT_EVERY:-10}
 cpu_threads=${OMP_NUM_THREADS:-1}
