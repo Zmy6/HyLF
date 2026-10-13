@@ -14,6 +14,81 @@ from utils.planar_voxel_utils import (
 
 
 class PlanarVoxelGrid(PlanarVoxelFactorization):
+    def __init__(self, in_channels, out_channels, cfg):
+        super().__init__(in_channels, out_channels, cfg)
+        self.dense_sampling = bool(getattr(cfg, "dense_sampling", False))
+
+    def _sample_dense_factors(self, xyz):
+        """Sample the active factors without data-dependent tensor shapes."""
+        density = xyz.new_zeros(xyz.shape[0])
+        appearance = []
+        for idx, axes in enumerate(self.plane_axes):
+            if not (self.density_component_counts[idx] or
+                    self.appearance_component_counts[idx]):
+                continue
+            # The common XY plane can use a view instead of advanced indexing.
+            xy = xyz[:, :2] if idx == 0 else xyz[:, axes]
+            plane_grid = xy.reshape(1, -1, 1, 2)
+            z = xyz[:, self.line_axes[idx]]
+            line_grid = torch.stack((torch.zeros_like(z), z), -1).reshape(1, -1, 1, 2)
+            if self.density_component_counts[idx]:
+                plane = F.grid_sample(self.density_planes[idx], plane_grid,
+                                      align_corners=True).reshape(-1, xyz.shape[0])
+                line = F.grid_sample(self.density_lines[idx], line_grid,
+                                     align_corners=True).reshape(-1, xyz.shape[0])
+                density = density + (plane * line).sum(0)
+            if self.appearance_component_counts[idx]:
+                plane = F.grid_sample(self.appearance_planes[idx], plane_grid,
+                                      align_corners=True).reshape(-1, xyz.shape[0])
+                line = F.grid_sample(self.appearance_lines[idx], line_grid,
+                                     align_corners=True).reshape(-1, xyz.shape[0])
+                appearance.append(plane * line)
+        if appearance:
+            features = appearance[0] if len(appearance) == 1 else torch.cat(appearance)
+            color = self.appearance_basis(features.T)
+        else:
+            color = xyz.new_zeros((xyz.shape[0], self.appearance_feature_channels))
+        return density, color
+
+    def forward_dense(self, x: Dict[str, torch.Tensor]):
+        """Equivalent masks with fixed shapes; suitable for compilation/graphs.
+
+        Masking color before its affine correction preserves the original
+        derivative at zero opacity. The training background coin is sampled
+        on the GPU, so its RNG sequence differs from the eager reference.
+        """
+        batch_size = x["points"].shape[0]
+        xyz = x["points"].reshape(batch_size, -1, 3)
+        distances = x["distances"].reshape(batch_size, -1)
+        deltas = torch.cat((distances[:, 1:] - distances[:, :-1],
+                            1e10 * torch.ones_like(distances[:, :1])), -1)
+        valid = self.valid_sample_mask(xyz) & (distances > 0)
+        normalized = self.normalize_points(xyz)
+        normalized = torch.where(valid[..., None], normalized, 0.0)
+        density, features = self._sample_dense_factors(normalized.reshape(-1, 3))
+        density = density.reshape_as(distances) * x["weights"].reshape_as(distances)
+        sigma = torch.where(valid, self.activate_density(density), 0.0)
+        weight = compute_volume_rendering_weights(
+            sigma, deltas * self.distance_scale, fast_cumprod=True
+        )
+        rgb = torch.where((weight > self.render_weight_threshold)[..., None],
+                          features.reshape(batch_size, -1, 3).sigmoid(), 0.0)
+        if "color_scale" in x:
+            rgb = apply_color_correction(rgb, x["color_scale"], x["color_shift"])
+        acc = weight.sum(-1)
+        rgb_map = (weight[..., None] * rgb).sum(-2)
+        if not self.black_background:
+            if self.white_background:
+                rgb_map = rgb_map + (1.0 - acc[:, None])
+            elif self.training:
+                white = torch.rand((), device=xyz.device) < 0.5
+                rgb_map = rgb_map + white * (1.0 - acc[:, None])
+        if not self.training:
+            rgb_map = rgb_map.clamp(0, 1)
+        with torch.no_grad():
+            depth = (weight * distances).sum(-1) + (1.0 - acc) * x["rays"][..., -1]
+        return {"rgb": rgb_map, "depth": depth.reshape(-1, 1)}
+
     def compute_density_features(self, xyz_sampled):
         coordinate_plane = torch.stack(
             (
@@ -37,6 +112,10 @@ class PlanarVoxelGrid(PlanarVoxelFactorization):
         for idx_plane, (plane, line) in enumerate(
             zip(self.density_planes, self.density_lines)
         ):
+            # HyLF's reference profile uses [8, 0, 0] components. Avoid
+            # launching grid_sample for the two empty plane/line pairs.
+            if plane.shape[1] == 0:
+                continue
             plane_coef_point = F.grid_sample(
                 plane, coordinate_plane[[idx_plane]], align_corners=True
             ).view(-1, xyz_sampled.shape[0])
@@ -73,6 +152,8 @@ class PlanarVoxelGrid(PlanarVoxelFactorization):
         for idx_plane, (plane, line) in enumerate(
             zip(self.appearance_planes, self.appearance_lines)
         ):
+            if plane.shape[1] == 0:
+                continue
             plane_coef_point.append(
                 F.grid_sample(
                     plane, coordinate_plane[[idx_plane]], align_corners=True
@@ -84,12 +165,18 @@ class PlanarVoxelGrid(PlanarVoxelFactorization):
                 ).view(-1, xyz_sampled.shape[0])
             )
 
+        if not plane_coef_point:
+            return xyz_sampled.new_zeros(
+                (xyz_sampled.shape[0], self.appearance_basis.out_features)
+            )
         plane_coef_point, line_coef_point = torch.cat(plane_coef_point), torch.cat(
             line_coef_point
         )
         return self.appearance_basis((plane_coef_point * line_coef_point).T)
 
     def forward(self, x: Dict[str, torch.Tensor]):
+        if self.dense_sampling:
+            return self.forward_dense(x)
         batch_size = x["points"].shape[0]
         num_samples = x["points"].shape[-1] // 3
         xyz_sampled = x["points"].view(batch_size, num_samples, 3)
