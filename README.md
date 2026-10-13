@@ -31,7 +31,7 @@ Each scene directory must contain only 81 RGB view images, sorted lexicographica
       <81 view images>
 ```
 
-Set `DATA_ROOT` to the directory containing the dataset folders. For the local five-dataset collection, use `/root/ACEFlow/data`, containing `HCI_new`, `HCI_old`, `30scene`, `occlusions`, and `reflective`. The scene loader also accepts other dataset directory names with the same layout.
+Set `DATA_ROOT` to the directory containing the dataset folders. For the local five-dataset collection, use `/root/data`, containing `HCI_new`, `HCI_old`, `30scene`, `occlusions`, and `reflective`. The scene loader also accepts other dataset directory names with the same layout.
 
 Images use their native resolution by default (`image_size: null`, `downsample: 1`); 512x512 inputs therefore remain 512x512. The angular grid size describes camera views, not image pixels.
 
@@ -46,23 +46,9 @@ bash scripts/train_experiment.sh <experiment-variant> <gpu-id> <scene> <angular-
 For example, train HyLF on `HCI_new/bedroom` for 20 epochs using views `010.jpg`, `016.jpg`, `064.jpg`, and `070.jpg`:
 
 ```bash
-DATA_ROOT=/root/ACEFlow/data NUM_EPOCHS=20 PRINT_LOSS=False \
+DATA_ROOT=/root/data NUM_EPOCHS=20 PRINT_LOSS=False \
 bash scripts/train_experiment.sh hylf 0 bedroom 6 HCI_new
 ```
-
-### Training views and evaluation coverage
-
-The script's angular step determines both the four training positions and the default evaluation region, if evaluation is enabled:
-
-| Step | Training image IDs | Default evaluation region | Held-out views in that region |
-| ---: | --- | :---: | ---: |
-| 6 | 010, 016, 064, 070 | Centered 7x7 | 45 |
-| 7 | 000, 007, 063, 070 | 8x8 starting at row/column 0 | 60 |
-| 8 | 000, 008, 072, 080 | Full 9x9 | 77 |
-
-For the task using `010/016/064/070` as inputs and the other 77 views of the full 9x9 grid as targets, keep **step 6** for training. The separate rendering stage must explicitly select those 77 targets; changing the training step to 8 changes the input views.
-
-The current entry point does not read `train_ids.txt` or `test_extrap_2x2_to_9x9_output.txt`. Step 6 selects the same four inputs as `/root/ACEFlow/data/train_ids.txt`; the 77-view task list must be handled by a separate rendering/evaluation workflow. The dataset's `val_pairs` option supports explicit evaluation coordinates.
 
 ## Evaluation
 
