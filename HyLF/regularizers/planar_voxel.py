@@ -49,12 +49,6 @@ class PlanarVoxelRegularizer(BaseRegularizer):
             self.graph_outer_weight = float(self.weight.start)
 
     def graph_loss(self, voxel_grid, include_tv):
-        """Pure form of the existing loss, preserving its density-TV sum.
-
-        The reference uses configured TV weights, not the decaying bookkeeping
-        attributes, and adds density TV a second time when appearance TV is
-        enabled. Keep those semantics to match the archived HyLF experiments.
-        """
         total_loss = self.l1_weight * voxel_grid.density_l1_loss()
         if include_tv:
             tv_loss = 0.0
