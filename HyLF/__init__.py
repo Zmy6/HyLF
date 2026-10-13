@@ -11,7 +11,7 @@ from omegaconf import ListConfig
 from PIL import Image
 from pytorch_lightning import LightningDataModule, LightningModule, Trainer
 from torch import nn
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, Dataset, RandomSampler
 
 from datasets import dataset_registry
 from losses import loss_registry
@@ -50,6 +50,17 @@ class HyLFTrainer(Trainer):
             super().save_checkpoint(*args, **kwargs)
 
 
+class _GpuSamplingSteps(Dataset):
+    def __init__(self, steps):
+        self.steps = int(steps)
+
+    def __len__(self):
+        return self.steps
+
+    def __getitem__(self, index):
+        return index
+
+
 class HyLFDataModule(LightningDataModule):
     def __init__(self, cfg):
         super().__init__()
@@ -57,7 +68,16 @@ class HyLFDataModule(LightningDataModule):
         self.current_epoch = 0
         self.test_every = cfg.training.test_every
         self.test_only = getattr(cfg.params, "test_only", False)
+        # When enabled for a throughput run, Lightning is configured with
+        # zero validation batches and no sanity check. Keep the flag here as
+        # well so we avoid constructing unused validation/test/render datasets
+        # and never reset a validation dataloader at epoch boundaries.
+        self.disable_validation = bool(
+            getattr(cfg.training, "disable_validation", False)
+        ) and not self.test_only and not getattr(cfg.params, "render_only", False)
         self.current_batch_size = cfg.training.batch_size
+        self.gpu_sampling = bool(getattr(cfg.training, "gpu_sampling", False))
+        self.gpu_training_samples = None
         self.prepared = False
 
     def prepare_data(self):
@@ -66,15 +86,50 @@ class HyLFDataModule(LightningDataModule):
         self.prepared = True
         dataset_class = dataset_registry[self.cfg.dataset.name]
         self.train_dataset = dataset_class(self.cfg, split="train")
-        self.val_dataset = dataset_class(self.cfg, split="val")
-        self.test_dataset = dataset_class(self.cfg, split="test")
-        self.render_dataset = dataset_class(self.cfg, split="render")
+        if self.disable_validation:
+            self.val_dataset = None
+            self.test_dataset = None
+            self.render_dataset = None
+        else:
+            self.val_dataset = dataset_class(self.cfg, split="val")
+            self.test_dataset = dataset_class(self.cfg, split="test")
+            self.render_dataset = dataset_class(self.cfg, split="render")
         self.original_dataset_size = len(self.train_dataset)
 
     def setup(self, stage=None):
         return None
 
+    def enable_gpu_sampling(self, device):
+        """Move the prepared training pool once and sample it on the GPU."""
+        if not self.gpu_sampling:
+            return None
+        if self.gpu_training_samples is None:
+            self.gpu_training_samples = self.train_dataset.training_samples.to(
+                device, non_blocking=True
+            )
+        return self.gpu_training_samples
+
     def train_dataloader(self):
+        if self.gpu_sampling:
+            if not self.cfg.training.sample_with_replacement:
+                raise ValueError(
+                    "gpu_sampling requires sample_with_replacement=True"
+                )
+            # The actual samples are selected in HyLFSystem.training_step.
+            # Avoid Python Dataset indexing, worker IPC and host-to-device
+            # copies on every update.
+            steps = getattr(
+                self.cfg.training,
+                "iters_per_epoch",
+                self.cfg.training.num_iters,
+            )
+            return DataLoader(
+                _GpuSamplingSteps(steps),
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+            )
         num_workers = self.cfg.training.num_workers
         if self.cfg.training.sample_with_replacement:
             sampler = RandomSampler(
@@ -101,6 +156,16 @@ class HyLFDataModule(LightningDataModule):
         )
 
     def val_dataloader(self):
+        if self.disable_validation:
+            # Trainer.limit_val_batches=0 normally prevents this method from
+            # being called. Return an empty loader as a defensive fallback for
+            # Lightning versions that still query the dataloader metadata.
+            return DataLoader(
+                _GpuSamplingSteps(0),
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+            )
         should_test = (self.current_epoch + 1) % self.test_every == 0 or self.test_only
         dataset = self.test_dataset if should_test else self.val_dataset
         num_workers = self.cfg.training.num_workers
@@ -118,6 +183,30 @@ class HyLFSystem(LightningModule):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.fast_mode = bool(getattr(cfg.training, "fast_mode", False))
+        self.gpu_sampling = bool(
+            getattr(cfg.training, "gpu_sampling", False) or self.fast_mode
+        )
+        self.skip_train_metrics = bool(
+            getattr(cfg.training, "skip_train_metrics", False) or self.fast_mode
+        )
+        self._compiled_training_loss = None
+        self._capture_training_graph = bool(getattr(cfg.training, "cuda_graph_training", False))
+        self._training_graph = None
+        self._graph_warmup_steps = 0
+        self._graph_regularizer_tv_active = ()
+        self._training_ray_chunk = int(cfg.training.ray_chunk)
+        if bool(getattr(cfg.training, "dense_voxel_sampling", False)):
+            cfg.model.color.net.dense_sampling = True
+            
+        if self.fast_mode and bool(
+            getattr(cfg.training, "prune_unused_outputs", True)
+        ):
+            try:
+                outputs = cfg.model.embedding.embeddings.hybrid_ray_predictor.outputs
+                outputs.pop("angular_flow", None)
+            except (AttributeError, KeyError, TypeError):
+                pass
         self.automatic_optimization = False
         self.training_started = False
         self.rendering = False
@@ -145,6 +234,9 @@ class HyLFSystem(LightningModule):
             key: copy.deepcopy(value)
             for key, value in cfg.training.optimizers.items()
         }
+        if self.fast_mode or bool(getattr(cfg.training, "fused_optimizer", False)):
+            for config in self.optimizer_configs.values():
+                config.fused = True
         self.optimizer_groups = self._collect_optimizer_groups()
         self.optimizer_groups["camera_geometry"] = [self.camera_plane_scale]
         self.loaded_checkpoint_epoch = None
@@ -162,6 +254,102 @@ class HyLFSystem(LightningModule):
                 cfg.training.weight_init
             )
         )
+
+    def on_fit_start(self):
+        if self.gpu_sampling and not (self.render_only or self.test_only):
+            self._gpu_training_samples = self.trainer.datamodule.enable_gpu_sampling(
+                self.device
+            )
+            if self._gpu_training_samples is None:
+                raise RuntimeError("gpu_sampling requires a prepared training dataset")
+            self._training_ray_channels = int(
+                self.trainer.datamodule.train_dataset.training_rays.shape[-1]
+            )
+        if bool(getattr(self.cfg.training, "native_grid_sample", False)):
+            torch.backends.cudnn.enabled = False
+        if bool(getattr(self.cfg.training, "compile_training", False)):
+            if not self.gpu_sampling or not self.render_fn.model.color_model.net.dense_sampling:
+                raise ValueError("compile_training requires GPU sampling and dense_voxel_sampling")
+            # PyTorch 2.1 defaults to treating nn.Module contents as immutable.
+            # HyLF replaces voxel Parameters and AABB buffers during upsample
+            # and shrink, so module guards are required to rebind the graph.
+            torch._dynamo.config.guard_nn_modules = True
+            graph_regularizers = self._capture_training_graph and bool(self.regularizers)
+            if graph_regularizers:
+                if not bool(getattr(self.cfg.training, "compile_regularizers", False)):
+                    raise ValueError("CUDA Graph regularizers require compile_regularizers=True")
+                if any(not isinstance(reg, regularizer_registry["planar_voxel"])
+                       or reg.graph_outer_weight is None for reg in self.regularizers):
+                    raise ValueError("Compiled regularizers require planar TV/L1 with constant outer weight")
+                self._graph_regularizer_tv_active = tuple(True for _ in self.regularizers)
+            self._compiled_training_loss = torch.compile(
+                self._gpu_regularized_loss if graph_regularizers else self._gpu_image_loss,
+                fullgraph=True,
+                mode="default" if self._capture_training_graph else "reduce-overhead",
+            )
+        if self._capture_training_graph:
+            if self._compiled_training_loss is None:
+                raise ValueError("cuda_graph_training requires compiled training")
+            if self.cfg.training.num_gpus != 1 or str(self.trainer.precision) not in {"32", "32-true"}:
+                raise ValueError("cuda_graph_training currently requires one GPU and FP32")
+
+    def _gpu_image_loss(self, values):
+        ray_channels = self._training_ray_channels
+        rays = self.parameterize_hybrid_rays(values[..., :ray_channels])
+        rgb = values[..., ray_channels:ray_channels + 3]
+        weight = values[..., -1:]
+        prediction = render_chunked(
+            rays, self.render_fn, chunk_size=self._training_ray_chunk
+        )["rgb"]
+        return self.loss(prediction * weight, rgb * weight), prediction
+
+    def _gpu_regularized_loss(self, values):
+        loss, prediction = self._gpu_image_loss(values)
+        grid = self.render_fn.model.color_model.net
+        for regularizer, include_tv in zip(self.regularizers, self._graph_regularizer_tv_active):
+            loss = loss + regularizer.graph_loss(grid, include_tv)
+        return loss, prediction
+
+    def _release_training_graph(self):
+        torch.cuda.synchronize()
+        self._training_graph = None
+        self._graph_loss = None
+        self._graph_values = None
+        self._graph_warmup_steps = 0
+
+    def _graph_training_step(self, values):
+        optimizers = self.optimizers(use_pl_optimizer=True)
+        if not isinstance(optimizers, list):
+            optimizers = [optimizers]
+        if self._graph_warmup_steps < 3:
+            # These are real, counted training updates; there are no hidden
+            # optimizer warmup updates or extra steps during graph capture.
+            loss, _ = self._compiled_training_loss(values)
+            for optimizer in optimizers:
+                optimizer.zero_grad(set_to_none=True)
+            self.manual_backward(loss)
+            self._graph_warmup_steps += 1
+        else:
+            if self._training_graph is None:
+                self._graph_values = values.detach().clone()
+                for optimizer in optimizers:
+                    optimizer.zero_grad(set_to_none=True)
+                self._training_graph = torch.cuda.CUDAGraph()
+                # Capture forward and backward together: intermediates remain
+                # in place, including the strided tensors that prevent
+                # Inductor from graphing the standalone backward function.
+                with torch.cuda.graph(self._training_graph):
+                    self._graph_loss, _ = self._compiled_training_loss(self._graph_values)
+                    self._graph_loss.backward()
+            else:
+                self._graph_values.copy_(values)
+            self._training_graph.replay()
+            loss = self._graph_loss
+        for optimizer in optimizers:
+            optimizer.step()
+        # Lightning may retain epoch outputs. Freeze the scalar now because
+        # the captured loss storage will be overwritten by the next replay.
+        return {"train/loss": loss.detach().clone()}
 
     def on_load_checkpoint(self, checkpoint):
         checkpoint_epoch = checkpoint.get("epoch")
@@ -204,13 +392,13 @@ class HyLFSystem(LightningModule):
         return groups
 
     def parameterize_hybrid_rays(self, rays):
-        origins = rays[..., :3].clone()
-        origins = torch.cat(
-            [origins[..., :2] * self.camera_plane_scale, origins[..., 2:3]],
-            dim=-1,
-        )
+        # Keep the camera-scale path differentiable while avoiding the extra
+        # clone used by the original implementation. This is on every ray
+        # batch, so the small reduction is measurable in the fast path.
+        origins_xy = rays[..., :2] * self.camera_plane_scale
+        origins = torch.cat([origins_xy, rays[..., 2:3]], dim=-1)
         directions = torch.cat(
-            [rays[..., 3:5] - origins[..., :2], rays[..., 5:6]],
+            [rays[..., 3:5] - origins_xy, rays[..., 5:6]],
             dim=-1,
         )
         directions = F.normalize(directions, p=2.0, dim=-1)
@@ -315,6 +503,8 @@ class HyLFSystem(LightningModule):
         )
 
     def _reset_optimizers(self, training_iteration):
+        if self._capture_training_graph:
+            self._release_training_graph()
         optimizers = []
         schedulers = []
         for index, (key, modules) in enumerate(self.optimizer_groups.items()):
@@ -357,17 +547,49 @@ class HyLFSystem(LightningModule):
         self.training_started = True
         training_iteration = self.get_training_iteration(self.current_epoch, batch_idx)
         self.set_training_iteration(training_iteration)
+        if self._capture_training_graph and self.regularizers:
+            phase = tuple(training_iteration <= reg.total_num_tv_iters for reg in self.regularizers)
+            if phase != self._graph_regularizer_tv_active:
+                self._graph_regularizer_tv_active = phase
+                # TV turns off after its last configured iteration; L1 remains.
+                # Rebuild capture without resetting Adam or counting extra steps.
+                self._release_training_graph()
         if self._needs_optimizer_reset(training_iteration):
             self._reset_optimizers(training_iteration)
 
-        batch = self.trainer.datamodule.train_dataset.format_training_batch(batch)
-        rays = self.parameterize_hybrid_rays(batch["rays"])
-        results = self(rays)
-        image_loss = self.loss(
-            results["rgb"] * batch["weight"],
-            batch["rgb"] * batch["weight"],
-            **batch,
-        )
+        results = None
+        if self.gpu_sampling:
+            samples = self._gpu_training_samples
+            index = torch.randint(
+                samples.shape[0],
+                (self.cfg.training.batch_size,),
+                device=samples.device,
+            )
+            values = samples[index]
+            if self._capture_training_graph:
+                return self._graph_training_step(values)
+            ray_channels = self.trainer.datamodule.train_dataset.training_rays.shape[-1]
+            rgb = values[..., ray_channels:ray_channels + 3]
+            weight = values[..., -1:]
+            loss_kwargs = {}
+            if self._compiled_training_loss is not None:
+                image_loss, prediction = self._compiled_training_loss(values)
+                results = {"rgb": prediction}
+            else:
+                rays = self.parameterize_hybrid_rays(values[..., :ray_channels])
+        else:
+            batch = self.trainer.datamodule.train_dataset.format_training_batch(batch)
+            rays = self.parameterize_hybrid_rays(batch["rays"])
+            rgb = batch["rgb"]
+            weight = batch["weight"]
+            loss_kwargs = batch
+        if results is None:
+            results = self(rays)
+            image_loss = self.loss(
+                results["rgb"] * weight,
+                rgb * weight,
+                **loss_kwargs,
+            )
         loss = image_loss
         regularizer_loss = 0.0
         for regularizer in self.regularizers:
@@ -378,8 +600,13 @@ class HyLFSystem(LightningModule):
             regularizer_loss += current_loss
             loss += current_loss
 
-        train_psnr = compute_tensor_psnr(results["rgb"], batch["rgb"]).detach()
+        if self.skip_train_metrics:
+            train_psnr = None
+        else:
+            train_psnr = compute_tensor_psnr(results["rgb"], rgb).detach()
         if self.cfg.params.print_loss:
+            if train_psnr is None:
+                train_psnr = compute_tensor_psnr(results["rgb"], rgb).detach()
             print(
                 f"Iter {training_iteration}: image_loss={image_loss:.4f}, "
                 f"regularizer_loss={regularizer_loss:.4f}, psnr={train_psnr:.4f}"
@@ -389,15 +616,15 @@ class HyLFSystem(LightningModule):
         if not isinstance(optimizers, list):
             optimizers = [optimizers]
         for optimizer in optimizers:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
         self.manual_backward(loss)
         for optimizer in optimizers:
             optimizer.step()
 
-        return {
-            "train/loss": loss.detach(),
-            "train/psnr": train_psnr,
-        }
+        outputs = {"train/loss": loss.detach()}
+        if train_psnr is not None:
+            outputs["train/psnr"] = train_psnr
+        return outputs
 
     def training_epoch_end(self, outputs):
         if (self.current_epoch + 1) % self.cfg.training.log_every == 0:
@@ -412,7 +639,10 @@ class HyLFSystem(LightningModule):
                 scheduler.step()
 
         self.trainer.datamodule.current_epoch = self.current_epoch + 1
-        if (self.current_epoch + 1) % self.trainer.datamodule.test_every in {0, 1}:
+        if (
+            not self.trainer.datamodule.disable_validation
+            and (self.current_epoch + 1) % self.trainer.datamodule.test_every in {0, 1}
+        ):
             self.trainer.reset_val_dataloader(self)
 
     def validation_output_epoch(self):
