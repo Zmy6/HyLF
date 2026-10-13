@@ -55,21 +55,27 @@ class EaseValue(nn.Module):
         self.wait_iters = getattr(cfg, "wait_iters", 0)
         self.window_iters = getattr(cfg, "window_iters", 0)
         self.current_iteration = 0
+        self.ease_weight = self._schedule_weight()
+
+    def _schedule_weight(self):
+        if self.current_iteration >= self.window_iters:
+            return 1.0
+        if self.window_iters == 0:
+            return 0.0
+        return min(max(self.current_iteration / float(self.window_iters), 0.0), 1.0)
 
     def forward(self, values):
         output = self.activation(values)
-        if self.current_iteration >= self.window_iters:
+        if self.ease_weight == 1.0:
             return output
-        if self.window_iters == 0:
+        if self.ease_weight == 0.0 and self.window_iters == 0:
             return torch.ones_like(output) * self.start_value
-        weight = min(
-            max(self.current_iteration / float(self.window_iters), 0.0),
-            1.0,
-        )
+        weight = self.ease_weight
         return weight * output + (1 - weight) * self.start_value
 
     def set_iteration(self, iteration):
         self.current_iteration = iteration - self.wait_iters
+        self.ease_weight = self._schedule_weight()
 
 
 activation_registry = {
