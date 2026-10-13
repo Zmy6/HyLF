@@ -46,7 +46,7 @@ fi
 
 python_executable=${PYTHON_BIN:-python}
 data_root=${DATA_ROOT:-/data}
-max_epochs=${NUM_EPOCHS:-30}
+max_epochs=${NUM_EPOCHS:-20}
 render_interval=${RENDER_EVERY:-20}
 print_loss=${PRINT_LOSS:-True}
 checkpoint_interval=${CKPT_EVERY:-10}
