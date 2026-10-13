@@ -68,10 +68,6 @@ class HyLFDataModule(LightningDataModule):
         self.current_epoch = 0
         self.test_every = cfg.training.test_every
         self.test_only = getattr(cfg.params, "test_only", False)
-        # When enabled for a throughput run, Lightning is configured with
-        # zero validation batches and no sanity check. Keep the flag here as
-        # well so we avoid constructing unused validation/test/render datasets
-        # and never reset a validation dataloader at epoch boundaries.
         self.disable_validation = bool(
             getattr(cfg.training, "disable_validation", False)
         ) and not self.test_only and not getattr(cfg.params, "render_only", False)
@@ -100,7 +96,6 @@ class HyLFDataModule(LightningDataModule):
         return None
 
     def enable_gpu_sampling(self, device):
-        """Move the prepared training pool once and sample it on the GPU."""
         if not self.gpu_sampling:
             return None
         if self.gpu_training_samples is None:
@@ -115,9 +110,6 @@ class HyLFDataModule(LightningDataModule):
                 raise ValueError(
                     "gpu_sampling requires sample_with_replacement=True"
                 )
-            # The actual samples are selected in HyLFSystem.training_step.
-            # Avoid Python Dataset indexing, worker IPC and host-to-device
-            # copies on every update.
             steps = getattr(
                 self.cfg.training,
                 "iters_per_epoch",
@@ -157,9 +149,6 @@ class HyLFDataModule(LightningDataModule):
 
     def val_dataloader(self):
         if self.disable_validation:
-            # Trainer.limit_val_batches=0 normally prevents this method from
-            # being called. Return an empty loader as a defensive fallback for
-            # Lightning versions that still query the dataloader metadata.
             return DataLoader(
                 _GpuSamplingSteps(0),
                 batch_size=1,
@@ -220,8 +209,6 @@ class HyLFSystem(LightningModule):
         self._convert_epoch_config_to_iterations()
         hylf_model = model_registry[cfg.model.type](cfg.model)
         if getattr(cfg.params, "reference_rng_compatibility", False):
-            # The reference startup profiled one random ray batch and one
-            # training-mode render before constructing the data sampler.
             torch.randn(1024, 6)
             torch.rand(1)
         self.render_fn = renderer_registry[cfg.model.render.type](hylf_model)
@@ -270,9 +257,6 @@ class HyLFSystem(LightningModule):
         if bool(getattr(self.cfg.training, "compile_training", False)):
             if not self.gpu_sampling or not self.render_fn.model.color_model.net.dense_sampling:
                 raise ValueError("compile_training requires GPU sampling and dense_voxel_sampling")
-            # PyTorch 2.1 defaults to treating nn.Module contents as immutable.
-            # HyLF replaces voxel Parameters and AABB buffers during upsample
-            # and shrink, so module guards are required to rebind the graph.
             torch._dynamo.config.guard_nn_modules = True
             graph_regularizers = self._capture_training_graph and bool(self.regularizers)
             if graph_regularizers:
@@ -322,8 +306,6 @@ class HyLFSystem(LightningModule):
         if not isinstance(optimizers, list):
             optimizers = [optimizers]
         if self._graph_warmup_steps < 3:
-            # These are real, counted training updates; there are no hidden
-            # optimizer warmup updates or extra steps during graph capture.
             loss, _ = self._compiled_training_loss(values)
             for optimizer in optimizers:
                 optimizer.zero_grad(set_to_none=True)
@@ -335,9 +317,6 @@ class HyLFSystem(LightningModule):
                 for optimizer in optimizers:
                     optimizer.zero_grad(set_to_none=True)
                 self._training_graph = torch.cuda.CUDAGraph()
-                # Capture forward and backward together: intermediates remain
-                # in place, including the strided tensors that prevent
-                # Inductor from graphing the standalone backward function.
                 with torch.cuda.graph(self._training_graph):
                     self._graph_loss, _ = self._compiled_training_loss(self._graph_values)
                     self._graph_loss.backward()
@@ -347,8 +326,6 @@ class HyLFSystem(LightningModule):
             loss = self._graph_loss
         for optimizer in optimizers:
             optimizer.step()
-        # Lightning may retain epoch outputs. Freeze the scalar now because
-        # the captured loss storage will be overwritten by the next replay.
         return {"train/loss": loss.detach().clone()}
 
     def on_load_checkpoint(self, checkpoint):
@@ -392,9 +369,6 @@ class HyLFSystem(LightningModule):
         return groups
 
     def parameterize_hybrid_rays(self, rays):
-        # Keep the camera-scale path differentiable while avoiding the extra
-        # clone used by the original implementation. This is on every ray
-        # batch, so the small reduction is measurable in the fast path.
         origins_xy = rays[..., :2] * self.camera_plane_scale
         origins = torch.cat([origins_xy, rays[..., 2:3]], dim=-1)
         directions = torch.cat(
@@ -551,8 +525,6 @@ class HyLFSystem(LightningModule):
             phase = tuple(training_iteration <= reg.total_num_tv_iters for reg in self.regularizers)
             if phase != self._graph_regularizer_tv_active:
                 self._graph_regularizer_tv_active = phase
-                # TV turns off after its last configured iteration; L1 remains.
-                # Rebuild capture without resetting Adam or counting extra steps.
                 self._release_training_graph()
         if self._needs_optimizer_reset(training_iteration):
             self._reset_optimizers(training_iteration)
